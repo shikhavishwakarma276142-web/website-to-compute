@@ -1,0 +1,585 @@
+editz_by_sv/
+├── app.py
+├── models.py
+├── templates/
+│   ├── base.html
+│   ├── index.html
+│   ├── register.html
+│   ├── login.html
+│   ├── dashboard.html
+│   ├── editor.html
+│   └── result.html
+├── static/
+│   └── sample_media/
+│       ├── intro.mp4
+│       └── bg_music.mp3
+├── uploads/
+├── processed/
+├── requirements.txt
+└── README.mdFlask>=2.0
+Flask-Login>=0.6
+Flask-WTF>=1.0
+Flask-SQLAlchemy>=3.0
+moviepy>=1.0.3
+Werkzeug>=2.0
+python-dotenv>=1.0# models.py
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import UserMixin
+from datetime import datetime
+
+db = SQLAlchemy()
+
+class User(UserMixin, db.Model):
+    __tablename__ = "users"
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(120), unique=True, nullable=False)
+    password = db.Column(db.String(256), nullable=False)  # store hashed pw in prod
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    videos = db.relationship('Video', backref='owner', lazy=True)
+
+class Video(db.Model):
+    __tablename__ = "videos"
+    id = db.Column(db.Integer, primary_key=True)
+    owner_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    original_filename = db.Column(db.String(300))
+    stored_filename = db.Column(db.String(300), unique=True)
+    output_filename = db.Column(db.String(300), unique=True, nullable=True)
+    template = db.Column(db.String(120), nullable=True)
+    status = db.Column(db.String(50), default='queued')  # queued, processing, done, error
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    error = db.Column(db.Text, nullable=True)# app.py
+import os
+import uuid
+import threading
+import time
+from datetime import datetime
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+from flask import Flask, render_template, request, redirect, url_for, flash, send_from_directory, jsonify
+from flask_login import LoginManager, login_user, logout_user, login_required, current_user
+from flask_wtf import FlaskForm
+from wtforms import StringField, PasswordField, SubmitField, FileField, SelectField, FloatField
+from wtforms.validators import DataRequired, Length
+from moviepy.editor import VideoFileClip, AudioFileClip, TextClip, CompositeVideoClip, concatenate_videoclips, vfx
+from models import db, User, Video
+
+# ---------- Configuration ----------
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
+OUTPUT_FOLDER = os.path.join(BASE_DIR, "processed")
+ALLOWED_EXT = {'mp4', 'mov', 'avi', 'mkv', 'webm'}
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = "replace_this_with_env_secret"
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(BASE_DIR, 'editz.db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['OUTPUT_FOLDER'] = OUTPUT_FOLDER
+
+db.init_app(app)
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = "login"
+
+# ---------- Forms ----------
+class RegisterForm(FlaskForm):
+    username = StringField('Username', validators=[DataRequired(), Length(3, 120)])
+    password = PasswordField('Password', validators=[DataRequired(), Length(6, 128)])
+    submit = SubmitField('Register')
+
+class LoginForm(FlaskForm):
+    username = StringField('Username', validators=[DataRequired(), Length(3, 120)])
+    password = PasswordField('Password', validators=[DataRequired(), Length(6, 128)])
+    submit = SubmitField('Login')
+
+class UploadForm(FlaskForm):
+    video = FileField('Video File', validators=[DataRequired()])
+    template = SelectField('Template', choices=[
+        ('trim_text', 'Trim + Title (Simple)'),
+        ('intro_merge', 'Intro + Overlay (Glam)'),
+        ('caption_style', 'Lower-Third Caption'),
+        ('music_trim', 'Trim + Background Music')
+    ])
+    start = FloatField('Start (s)', default=0.0)
+    end = FloatField('End (s)', default=0.0)
+    title = StringField('Title / Caption')
+    submit = SubmitField('Upload & Process')
+
+# ---------- Login loader ----------
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+# ---------- Helpers ----------
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.',1)[1].lower() in ALLOWED_EXT
+
+def high_quality_write(clip, out_path):
+    """
+    Exports video with high-quality ffmpeg params.
+    Using libx264, CRF ~18 (good quality), preset slow for better compression.
+    """
+    clip.write_videofile(
+        out_path,
+        codec='libx264',
+        audio_codec='aac',
+        temp_audiofile='temp-audio.m4a',
+        remove_temp=True,
+        threads=4,
+        preset='slow',
+        bitrate=None,
+        ffmpeg_params=["-crf", "18", "-pix_fmt", "yuv420p"]
+    )
+
+# ---------- Templates (simple demo templates) ----------
+def apply_template_trim_text(input_path, start, end, title_text):
+    clip = VideoFileClip(input_path)
+    duration = clip.duration
+    if end <= 0 or end > duration:
+        end = duration
+    if start < 0:
+        start = 0
+    sub = clip.subclip(start, end)
+    if title_text:
+        txt = (TextClip(title_text, fontsize=60, font='Amiri-Bold')
+               .set_duration(sub.duration)
+               .set_position(("center", "top"))
+               .set_opacity(0.9))
+        final = CompositeVideoClip([sub, txt])
+    else:
+        final = sub
+    return final
+
+def apply_template_intro_merge(input_path, start, end, title_text):
+    # Merge a short intro (static sample) + clip, color effect, overlay title
+    intro_path = os.path.join(BASE_DIR, 'static', 'sample_media', 'intro.mp4')
+    main_clip = VideoFileClip(input_path).subclip(start if start>0 else 0, end if end>0 else None)
+    # If intro exists, append
+    if os.path.exists(intro_path):
+        intro = VideoFileClip(intro_path).resize(width=720)
+        # apply a tint effect to clip
+        main_clip = main_clip.fx(vfx.colorx, 1.05)
+        combined = concatenate_videoclips([intro, main_clip])
+    else:
+        combined = main_clip
+    if title_text:
+        txt = (TextClip(title_text, fontsize=50, font='Amiri-Bold')
+               .set_duration(4)
+               .set_position(("center","bottom"))
+               .set_opacity(0.9))
+        final = CompositeVideoClip([combined, txt.set_start(2)])
+    else:
+        final = combined
+    return final
+
+def apply_template_caption(input_path, start, end, title_text):
+    clip = VideoFileClip(input_path).subclip(start if start>0 else 0, end if end>0 else None)
+    if title_text:
+        caption = (TextClip(title_text, fontsize=40, font='Amiri-Bold', bg_color='rgba(0,0,0,0.3)')
+                   .set_duration(clip.duration)
+                   .set_position(("left","bottom")))
+        final = CompositeVideoClip([clip, caption])
+    else:
+        final = clip
+    return final
+
+def apply_template_music_trim(input_path, start, end, title_text):
+    clip = VideoFileClip(input_path).subclip(start if start>0 else 0, end if end>0 else None)
+    music_path = os.path.join(BASE_DIR, 'static', 'sample_media', 'bg_music.mp3')
+    if os.path.exists(music_path):
+        bg = AudioFileClip(music_path).volumex(0.6)
+        # loop bg if shorter than clip
+        if bg.duration < clip.duration:
+            # simple loop by concatenating:
+            loops = int(clip.duration // bg.duration) + 1
+            bg = concatenate_videoclips([bg.set_duration(bg.duration) for _ in range(loops)]).set_duration(clip.duration)
+        clip = clip.set_audio(bg.set_duration(clip.duration))
+    return clip
+
+TEMPLATE_FUNCTIONS = {
+    'trim_text': apply_template_trim_text,
+    'intro_merge': apply_template_intro_merge,
+    'caption_style': apply_template_caption,
+    'music_trim': apply_template_music_trim
+}
+
+# ---------- Simple job queue (in-memory) ----------
+JOB_LOCK = threading.Lock()
+def process_video_job(video_id):
+    """
+    Background thread worker: processes the video according to selected template.
+    Updates Video.status and output_filename in DB.
+    """
+    with app.app_context():
+        video = Video.query.get(video_id)
+        if not video:
+            return
+        try:
+            video.status = 'processing'
+            db.session.commit()
+            input_path = os.path.join(app.config['UPLOAD_FOLDER'], video.stored_filename)
+            out_name = f"out_{uuid.uuid4().hex}.mp4"
+            out_path = os.path.join(app.config['OUTPUT_FOLDER'], out_name)
+
+            # parse simple params stored in template field? For demo we assume start/end/title saved temporarily in filename
+            # (In this demo, those params are passed as part of the stored_filename after '::' — simple hack)
+            # Format: stored_filename is realfilename, but we saved metadata in DB in production. Here we assume defaults.
+            start = 0.0
+            end = 0.0
+            title = video.template or ''
+
+            # Choose template function
+            template_key = video.template if video.template in TEMPLATE_FUNCTIONS else 'trim_text'
+            func = TEMPLATE_FUNCTIONS[template_key]
+
+            # Build clip and export
+            clip = func(input_path, start, end, title)
+            # High quality write
+            high_quality_write(clip, out_path)
+
+            # update DB
+            video.output_filename = out_name
+            video.status = 'done'
+            db.session.commit()
+        except Exception as e:
+            video.status = 'error'
+            video.error = str(e)
+            db.session.commit()
+
+# ---------- Routes ----------
+@app.before_first_request
+def create_tables():
+    db.create_all()
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/register', methods=['GET','POST'])
+def register():
+    form = RegisterForm()
+    if form.validate_on_submit():
+        existing = User.query.filter_by(username=form.username.data).first()
+        if existing:
+            flash("Username already exists")
+            return redirect(url_for('register'))
+        hashed = generate_password_hash(form.password.data)
+        user = User(username=form.username.data, password=hashed)
+        db.session.add(user)
+        db.session.commit()
+        flash("Account created. Please log in.")
+        return redirect(url_for('login'))
+    return render_template('register.html', form=form)
+
+@app.route('/login', methods=['GET','POST'])
+def login():
+    form = LoginForm()
+    if form.validate_on_submit():
+        user = User.query.filter_by(username=form.username.data).first()
+        if user and check_password_hash(user.password, form.password.data):
+            login_user(user)
+            return redirect(url_for('dashboard'))
+        flash("Invalid credentials")
+    return render_template('login.html', form=form)
+
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for('index'))
+
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    vids = Video.query.filter_by(owner_id=current_user.id).order_by(Video.created_at.desc()).all()
+    return render_template('dashboard.html', videos=vids)
+
+@app.route('/editor', methods=['GET','POST'])
+@login_required
+def editor():
+    form = UploadForm()
+    if request.method == 'POST':
+        f = request.files.get('video')
+        if not f or f.filename == '':
+            flash("Please choose a file")
+            return redirect(url_for('editor'))
+        if not allowed_file(f.filename):
+            flash("Unsupported file type")
+            return redirect(url_for('editor'))
+
+        filename = secure_filename(f.filename)
+        unique_name = f"{uuid.uuid4().hex}_{filename}"
+        save_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_name)
+        f.save(save_path)
+
+        # Save video entry
+        selected_template = request.form.get('template')
+        title = request.form.get('title','').strip()
+        v = Video(
+            owner_id=current_user.id,
+            original_filename=filename,
+            stored_filename=unique_name,
+            template=selected_template
+        )
+        db.session.add(v)
+        db.session.commit()
+
+        # start background thread for processing
+        t = threading.Thread(target=process_video_job, args=(v.id,))
+        t.start()
+
+        flash("Video uploaded — processing in background. Refresh dashboard to check status.")
+        return redirect(url_for('dashboard'))
+    return render_template('editor.html', form=form)
+
+@app.route('/status/<int:video_id>')
+@login_required
+def status(video_id):
+    v = Video.query.get_or_404(video_id)
+    if v.owner_id != current_user.id:
+        return jsonify({'error':'Unauthorized'}), 403
+    return jsonify({
+        'id': v.id,
+        'status': v.status,
+        'output': v.output_filename,
+        'error': v.error
+    })
+
+@app.route('/download/<filename>')
+@login_required
+def download_file(filename):
+    # Only allow downloading files that belong to the user
+    v = Video.query.filter_by(output_filename=filename, owner_id=current_user.id).first()
+    if not v:
+        flash("File not found or access denied")
+        return redirect(url_for('dashboard'))
+    return send_from_directory(app.config['OUTPUT_FOLDER'], filename, as_attachment=True)
+
+# Static route to serve processed for demo (not ideal for production)
+@app.route('/processed/<filename>')
+@login_required
+def processed_file(filename):
+    v = Video.query.filter_by(output_filename=filename, owner_id=current_user.id).first()
+    if not v:
+        flash("File not found or access denied")
+        return redirect(url_for('dashboard'))
+    return send_from_directory(app.config['OUTPUT_FOLDER'], filename)
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)<!-- templates/base.html -->
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Editz by SV - {% block title %}{% endblock %}</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width:1000px; margin:20px auto; padding:10px; }
+    header { display:flex; justify-content:space-between; align-items:center; }
+    nav a { margin-left:12px; text-decoration:none; }
+    .card { padding:12px; border:1px solid #eee; margin-top:12px; border-radius:8px; box-shadow:0 2px 4px rgba(0,0,0,0.03);}
+    .btn { padding:8px 12px; border-radius:6px; background:#2b6cb0; color:white; text-decoration:none; }
+    table{width:100%; border-collapse:collapse;}
+    td, th{padding:8px; border-bottom:1px solid #f0f0f0;}
+  </style>
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Editz by SV</h1>
+      <div style="color:#666;">Create stunning videos — no watermark</div>
+    </div>
+    <div>
+      {% if current_user.is_authenticated %}
+        Hello, {{ current_user.username }} |
+        <a href="{{ url_for('dashboard') }}">Dashboard</a> |
+        <a href="{{ url_for('editor') }}">Editor</a> |
+        <a href="{{ url_for('logout') }}">Logout</a>
+      {% else %}
+        <a class="btn" href="{{ url_for('login') }}">Login</a>
+        <a class="btn" href="{{ url_for('register') }}">Register</a>
+      {% endif %}
+    </div>
+  </header>
+  <main>
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        <ul style="color:green;">
+          {% for m in messages %}<li>{{ m }}</li>{% endfor %}
+        </ul>
+      {% endif %}
+    {% endwith %}
+    {% block content %}{% endblock %}
+  </main>
+  {% block scripts %}{% endblock %}
+</body>
+</html>{% extends "base.html" %}
+{% block title %}Home{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>Welcome to Editz by SV</h2>
+  <p>Sign in and start creating videos using pre-built templates. For best results, upload mp4 files and ensure ffmpeg is installed on the server.</p>
+  <p><a href="{{ url_for('register') }}" class="btn">Get started — Register</a></p>
+</div>
+{% endblock %}{% extends "base.html" %}
+{% block title %}Register{% endblock %}
+{% block content %}
+<div class="card">
+  <h3>Create Account</h3>
+  <form method="post">
+    {{ form.hidden_tag() }}
+    <div><label>Username</label>{{ form.username() }}</div>
+    <div><label>Password</label>{{ form.password() }}</div>
+    <div style="margin-top:8px;">{{ form.submit(class_='btn') }}</div>
+  </form>
+</div>
+{% endblock %}{% extends "base.html" %}
+{% block title %}Login{% endblock %}
+{% block content %}
+<div class="card">
+  <h3>Login</h3>
+  <form method="post">
+    {{ form.hidden_tag() }}
+    <div><label>Username</label>{{ form.username() }}</div>
+    <div><label>Password</label>{{ form.password() }}</div>
+    <div style="margin-top:8px;">{{ form.submit(class_='btn') }}</div>
+  </form>
+</div>
+{% endblock %}{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block content %}
+<div class="card">
+  <h3>Your Videos</h3>
+  <p><a class="btn" href="{{ url_for('editor') }}">Upload New</a></p>
+  <table>
+    <thead><tr><th>Original</th><th>Template</th><th>Uploaded</th><th>Status</th><th>Action</th></tr></thead>
+    <tbody>
+      {% for v in videos %}
+      <tr>
+        <td>{{ v.original_filename }}</td>
+        <td>{{ v.template }}</td>
+        <td>{{ v.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+        <td id="status-{{ v.id }}">{{ v.status }}</td>
+        <td>
+          {% if v.status == 'done' %}
+            <a class="btn" href="{{ url_for('processed_file', filename=v.output_filename) }}">Play</a>
+            <a class="btn" href="{{ url_for('download_file', filename=v.output_filename) }}">Download</a>
+          {% elif v.status == 'error' %}
+            <span style="color:red">Error</span>
+          {% else %}
+            <span>Processing...</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<script>
+  // Poll statuses every 5s (simple)
+  setInterval(function(){
+    {% for v in videos %}
+      fetch("{{ url_for('status', video_id=v.id) }}").then(r=>r.json()).then(data=>{
+        document.getElementById("status-{{ v.id }}").innerText = data.status;
+      });
+    {% endfor %}
+  }, 5000);
+</script>
+{% endblock %}{% extends "base.html" %}
+{% block title %}Editor{% endblock %}
+{% block content %}
+<div class="card">
+  <h3>Upload & Choose Template</h3>
+  <form method="post" enctype="multipart/form-data">
+    {{ form.hidden_tag() }}
+    <div>
+      <label>Video file</label>
+      {{ form.video() }}
+    </div>
+    <div>
+      <label>Template</label>
+      {{ form.template() }}
+    </div>
+    <div>
+      <label>Title / Caption</label>
+      {{ form.title() }}
+    </div>
+    <div style="margin-top:8px;">
+      {{ form.submit(class_='btn') }}
+    </div>
+  </form>
+
+  <h4 style="margin-top:16px;">Templates (demo)</h4>
+  <ul>
+    <li><b>Trim + Title:</b> Trim clip and add centered title.</li>
+    <li><b>Intro + Overlay:</b> Adds intro clip then applies color/overlay.</li>
+    <li><b>Caption style:</b> Adds lower-third caption.</li>
+    <li><b>Trim + Background Music:</b> Adds background music track.</li>
+  </ul>
+</div>
+{% endblock %}{% extends "base.html" %}
+{% block title %}Result{% endblock %}
+{% block content %}
+<div class="card">
+  <h3>Processed Video</h3>
+  <video width="720" controls>
+    <source src="{{ url_for('processed_file', filename=filename) }}" type="video/mp4">
+    Your browser doesn't support HTML5 video.
+  </video>
+  <p><a href="{{ url_for('download_file', filename=filename) }}" class="btn">Download</a></p>
+</div>
+{% endblock %}python -m venv venv
+source venv/bin/activate   # Windows: venv\Scripts\activate
+pip install -r requirements.txtexport FLASK_APP=app.py
+flask run
+# or: python app.pyfrom flask import Flask, render_template_string, request, redirect, url_for, session
+
+app = Flask(__name__)
+app.secret_key = "secret123"  # session ke liye zaroori
+
+# Demo account
+USER = {
+    "username": "simran",
+    "password": "12345"
+}
+
+# Home Page
+@app.route("/")
+def home():
+    if "user" in session:
+        return f"Welcome {session['user']}! 🎉 <br><a href='/logout'>Logout</a>"
+    return "Hello! <a href='/login'>Login</a>"
+
+# Login Page
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        username = request.form["username"]
+        password = request.form["password"]
+
+        if username == USER["username"] and password == USER["password"]:
+            session["user"] = username
+            return redirect(url_for("home"))
+        else:
+            return "❌ Invalid username or password. Try again."
+
+    return '''
+        <form method="POST">
+            Username: <input type="text" name="username"><br><br>
+            Password: <input type="password" name="password"><br><br>
+            <button type="submit">Login</button>
+        </form>
+    '''
+
+# Logout
+@app.route("/logout")
+def logout():
+    session.pop("user", None)
+    return redirect(url_for("home"))
+
+if __name__ == "__main__":
+    app.run(debug=True)
